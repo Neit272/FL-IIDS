@@ -6,11 +6,26 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 def weighted_average(metrics):
     total_examples = 0
-    federated_metrics = {k: 0 for k in metrics[0][1].keys()}
+    # Khởi tạo federated_metrics chỉ với các keys có giá trị là số từ metrics đầu tiên
+    # và đảm bảo chúng ta không cố gắng tổng hợp các giá trị không phải số
+    federated_metrics = {}
+    if metrics and metrics[0][1]:
+        for k_init, v_init in metrics[0][1].items():
+            if isinstance(v_init, (int, float)): # Chỉ khởi tạo nếu là số
+                federated_metrics[k_init] = 0.0 # Dùng float để nhất quán
+
+    if not federated_metrics: # Nếu không có metric số nào
+        return {}
+
     for num_examples, m in metrics:
         for k, v in m.items():
-            federated_metrics[k] += num_examples * v
+            if k in federated_metrics and isinstance(v, (int, float)): # Chỉ xử lý các key đã khởi tạo và là số
+                federated_metrics[k] += num_examples * v
         total_examples += num_examples
+
+    if total_examples == 0:
+        return {k: 0.0 for k in federated_metrics} # Tránh chia cho 0
+
     return {k: v / total_examples for k, v in federated_metrics.items()}
 
 def fit_config(server_round: int):
