@@ -1,73 +1,220 @@
 import os
-import tensorflow as tf
 import flwr as fl
-import utils.data_loader as data_loader
-import utils.model_loader as model_loader
+import tensorflow as tf
+import numpy as np
+from typing import Dict, Tuple, List, Optional
+
+from utils.data_loader import get_data
+from utils.model_loader import get_model
 from utils.memory import DynamicExampleMemory
-from utils.data_loader import batch_generator, get_mixed_batch
+from utils.losses import (
+    calculate_lls_loss,
+    calculate_lgb_proxy_loss,
+    GAMMA_LLS,
+    GAMMA_LGB,
+)
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+CLASS_MAPPING = {
+    "Normal": 0,
+    "Analysis": 1,
+    "Backdoor": 2,
+    "DoS": 3,
+    "Exploits": 4,
+    "Fuzzers": 5,
+    "Generic": 6,
+    "Reconnaissance": 7,
+    "Shellcode": 8,
+}
+TASK_CLASSES = {
+    1: [CLASS_MAPPING[c] for c in ["Normal", "Analysis", "Backdoor"]],
+    2: [CLASS_MAPPING[c] for c in ["DoS", "Exploits", "Fuzzers"]],
+    3: [CLASS_MAPPING[c] for c in ["Generic", "Reconnaissance", "Shellcode"]],
+}
+NUM_CLASSES = len(CLASS_MAPPING)
 
 
-# Make tensorflow log less verbose
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+class FLIIDSModel(tf.keras.Model):
+    def __init__(self, original_model, num_classes):
+        super().__init__(inputs=original_model.inputs, outputs=original_model.outputs)
+        self.original_model = original_model
+        self.num_classes = num_classes
+        self.best_old_model_weights = None
+        self.old_class_indices = None
+        self.gamma_lls = GAMMA_LLS
+        self.gamma_lgb = GAMMA_LGB
+        self.old_model_inference = None
+
+    def compile(self, optimizer, metrics, **kwargs):
+        super().compile(
+            optimizer=optimizer,
+            loss=tf.keras.losses.CategoricalCrossentropy(name="compiled_loss"),
+            metrics=metrics,
+            **kwargs
+        )
+        if self.best_old_model_weights is not None:
+            self.old_model_inference = tf.keras.models.clone_model(self.original_model)
+            self.old_model_inference.set_weights(self.best_old_model_weights)
+            self.old_model_inference.trainable = False
+
+    def set_incremental_params(self, old_weights, old_indices):
+        self.best_old_model_weights = old_weights
+        self.old_class_indices = (
+            tf.constant(old_indices, dtype=tf.int32) if old_indices else None
+        )
+        if self.best_old_model_weights is not None:
+            if self.old_model_inference is None:
+                self.old_model_inference = tf.keras.models.clone_model(
+                    self.original_model
+                )
+            self.old_model_inference.set_weights(self.best_old_model_weights)
+            self.old_model_inference.trainable = False
+
+    @tf.function
+    def train_step(self, data):
+        x, y_true, is_old_flags = data
+        with tf.GradientTape() as tape:
+            y_pred_current = self(x, training=True)
+            loss_base = calculate_lgb_proxy_loss(
+                y_true, y_pred_current, {"is_old": is_old_flags}
+            )
+            loss_lls = tf.constant(0.0)
+            if (
+                self.old_model_inference is not None
+                and self.old_class_indices is not None
+            ):
+                y_pred_old = self.old_model_inference(x, training=False)
+                loss_lls = calculate_lls_loss(
+                    y_true, y_pred_current, y_pred_old, self.old_class_indices
+                )
+            total_loss = (
+                self.gamma_lgb * loss_base
+                + self.gamma_lls * loss_lls
+                + sum(self.losses)
+            )
+        grads = tape.gradient(total_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+        self.compiled_loss(y_true, y_pred_current)
+        self.compiled_metrics.update_state(y_true, y_pred_current)
+        return {m.name: m.result() for m in self.metrics}
+
 
 class Client(fl.client.NumPyClient):
-    def __init__(self):
-        self.X_train, self.Y_train, self.X_test, self.Y_test = data_loader.get_data()
-        self.model = model_loader.get_model(self.X_train.shape[1:])
-        # --- thêm vào ---
-        self.dem = DynamicExampleMemory(max_size=5000)        # hoặc bất cứ giá trị phù hợp
-        self.train_gen = batch_generator(self.X_train, self.Y_train, batch_size=32)
+    def __init__(self, client_id="0", dem_max_size=500):
+        self.client_id = client_id
+        self.X_train_full, self.Y_train_full, self.X_test, self.Y_test = get_data()
+        self.Y_train_full = self.Y_train_full.astype(int)
+        self.Y_test = self.Y_test.astype(int)
+        self.num_classes = NUM_CLASSES
+
+        self.base_model = get_model(self.X_train_full.shape[1:], self.num_classes)
+        self.model = FLIIDSModel(self.base_model, self.num_classes)
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.01),
+            metrics=[
+                tf.keras.metrics.CategoricalAccuracy(name="accuracy"),
+                tf.keras.metrics.CategoricalCrossentropy(name="loss"),
+            ],
+        )
+
+        self.memory = DynamicExampleMemory(max_size=dem_max_size)
+        self.current_task_id = 0
+        self.best_old_model_weights = None
+        self.all_trained_class_indices = []
 
     def get_parameters(self, config):
         return self.model.get_weights()
 
+    def _load_data_for_task(self, task_id):
+        if task_id not in TASK_CLASSES:
+            return np.array([]), np.array([])
+        classes = TASK_CLASSES[task_id]
+        idx = np.isin(self.Y_train_full, classes)
+        return self.X_train_full[idx], self.Y_train_full[idx]
+
     def fit(self, parameters, config):
-        # 1. load weights từ server
         self.model.set_weights(parameters)
 
-        # 2. vòng local epochs (ở bài báo mỗi client train 1 epoch)
-        total_steps = len(self.X_train) // 32
-        for _ in range(total_steps):
-            # 2.1 lấy batch hỗn hợp và batch mới tách riêng
-            x_batch, y_batch, x_new, y_new, self.train_gen = get_mixed_batch(
-                self.train_gen,
-                self.dem,
-                new_bs=32,
-                mem_bs=16,
-                X_full=self.X_train,
-                Y_full=self.Y_train
+        round_id = config.get("server_round", 1)
+        total_rounds = config.get("num_rounds", 9)
+        batch_size = config.get("batch_size", 64)
+        epochs = config.get("local_epochs", 1)
+
+        num_tasks = len(TASK_CLASSES)
+        rounds_per_task = max(1, total_rounds // num_tasks)
+        new_task_id = min(((round_id - 1) // rounds_per_task) + 1, num_tasks)
+
+        if new_task_id != self.current_task_id:
+            if self.current_task_id > 0:
+                self.best_old_model_weights = self.model.get_weights()
+            self.current_task_id = new_task_id
+            self.memory.update_task(self.current_task_id, {})
+            self.all_trained_class_indices = sorted(
+                set(
+                    cls
+                    for i in range(1, self.current_task_id + 1)
+                    for cls in TASK_CLASSES.get(i, [])
+                )
             )
 
-            # Chuyển x_new, y_new về Tensor nếu còn là numpy array
-            x_new_t = tf.convert_to_tensor(x_new)
-            y_new_t = tf.convert_to_tensor(y_new)
+        x_new, y_new = self._load_data_for_task(self.current_task_id)
+        x_mem, y_mem = self.memory.sample(batch_size=batch_size // 2)
 
-            # 2.2 forward trên batch mới để tính loss cá thể
-            logits = self.model(x_new_t, training=True)
-            losses_new = tf.keras.losses.sparse_categorical_crossentropy(
-                y_new_t,        # labels
-                logits,         # model outputs
-                from_logits=False  # nếu model dùng softmax ở cuối
-            )  # losses_new là tensor shape (new_bs,)
-            # 2.3 update memory với loss của mẫu mới
-            self.dem.update(x_new.tolist(), y_new.tolist(),
-                            losses_new.numpy() if isinstance(losses_new, tf.Tensor) else losses_new)
+        if x_mem is not None and len(x_mem) > 0:
+            x_combined = np.concatenate((x_new, x_mem))
+            y_combined = np.concatenate((y_new, y_mem))
+            is_old = np.concatenate(
+                (np.zeros(len(x_new), dtype=bool), np.ones(len(x_mem), dtype=bool))
+            )
+        else:
+            x_combined = x_new
+            y_combined = y_new
+            is_old = np.zeros(len(x_combined), dtype=bool)
 
-            # 2.4 train chung batch (new + memory)
-            self.model.train_on_batch(x_batch, y_batch)
+        y_one_hot = tf.keras.utils.to_categorical(
+            y_combined, num_classes=self.num_classes
+        )
+        dataset = tf.data.Dataset.from_tensor_slices((x_combined, y_one_hot, is_old))
+        dataset = (
+            dataset.shuffle(len(x_combined))
+            .batch(batch_size)
+            .prefetch(tf.data.AUTOTUNE)
+        )
 
-        # 3. trả lại tham số, số mẫu và metrics
-        weights = self.model.get_weights()
-        # bạn có thể thu thập loss/acc cuối cùng bằng evaluate trên X_train, hoặc track thủ công
-        train_loss, train_acc = self.model.evaluate(self.X_train, self.Y_train, verbose=0)
-        return weights, len(self.X_train), {"loss": train_loss, "accuracy": train_acc}
+        old_classes = [
+            i
+            for i in self.all_trained_class_indices
+            if i not in TASK_CLASSES[self.current_task_id]
+        ]
+        self.model.set_incremental_params(self.best_old_model_weights, old_classes)
 
-    def evaluate(self, parameters, _):
+        history = self.model.fit(dataset, epochs=epochs, verbose=0)
+        self.memory.store_samples(x_new, y_new)
+
+        loss = history.history.get("loss", [0.0])[-1]
+        acc = history.history.get("accuracy", [0.0])[-1]
+        return (
+            self.model.get_weights(),
+            len(x_combined),
+            {"loss": float(loss), "accuracy": float(acc)},
+        )
+
+    def evaluate(self, parameters, config):
         self.model.set_weights(parameters)
-        loss, accuracy = self.model.evaluate(self.X_test, self.Y_test)
-        return loss, len(self.X_test), {"accuracy": accuracy}
+        y_test_one_hot = tf.keras.utils.to_categorical(
+            self.Y_test, num_classes=self.num_classes
+        )
+        results = self.model.evaluate(self.X_test, y_test_one_hot, verbose=0)
+        return float(results[0]), len(self.X_test), {"accuracy": float(results[1])}
+
+
+def create_client(cid):
+    return Client(client_id=cid)
 
 
 if __name__ == "__main__":
+    client_id = os.getenv("CLIENT_ID", "client_0")
     server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1:8080")
-    fl.client.start_numpy_client(server_address=server_address, client=Client())
+    client = Client(client_id=client_id)
+    fl.client.start_numpy_client(server_address=server_address, client=client)

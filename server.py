@@ -13,6 +13,17 @@ def weighted_average(metrics):
         total_examples += num_examples
     return {k: v / total_examples for k, v in federated_metrics.items()}
 
+def fit_config(server_round: int):
+    """Return training configuration dict for each round."""
+    config = {
+        "server_round": server_round,
+        "local_epochs": 1, # Số epoch huấn luyện local mỗi round
+        "batch_size": 64,
+        "num_rounds": 9 # Tổng số rounds FL
+        # Thêm các config khác nếu cần
+    }
+    return config
+
 def get_server_strategy():
     return fl.server.strategy.FedAvg(
             min_fit_clients=3,
@@ -20,6 +31,7 @@ def get_server_strategy():
             min_available_clients=3,
             fit_metrics_aggregation_fn=weighted_average,
             evaluate_metrics_aggregation_fn=weighted_average,
+            on_fit_config_fn=fit_config,
         )
     
 if __name__ == "__main__":
