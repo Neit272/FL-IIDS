@@ -48,8 +48,6 @@ def _separate_features_and_labels(data):
     X = data.drop(columns="label").to_numpy()
     return X, Y
 
- #tiếp
-
 def get_mixed_batch(train_gen, dem: DynamicExampleMemory,
                     new_bs: int, mem_bs: int,
                     X_full=None, Y_full=None):
@@ -63,16 +61,12 @@ def get_mixed_batch(train_gen, dem: DynamicExampleMemory,
     try:
         x_new, y_new = next(train_gen)
     except StopIteration:
-        # nếu iterator cũ hết, tạo lại
         train_gen = batch_generator(X_full, Y_full, new_bs)
         x_new, y_new = next(train_gen)
 
-    # lấy từ memory
     x_mem, y_mem = dem.sample(mem_bs)
 
-    # ghép batch mới + batch từ memory
     if len(x_mem) > 0:
-        # X, Y là numpy arrays
         x_batch = np.vstack([x_new, np.array(x_mem)])
         y_batch = np.concatenate([y_new, np.array(y_mem)])
     else:

@@ -4,6 +4,7 @@ import tensorflow as tf
 import numpy as np
 from typing import Dict, Tuple, List, Optional
 
+from utils.config import USE_DEM, USE_LGB_LLS
 from utils.data_loader import get_data
 from utils.model_loader import get_model
 from utils.memory import DynamicExampleMemory
@@ -71,32 +72,56 @@ class FLIIDSModel(tf.keras.Model):
             self.old_model_inference.set_weights(self.best_old_model_weights)
             self.old_model_inference.trainable = False
 
+
     @tf.function
     def train_step(self, data):
         x, y_true, is_old_flags = data
+
         with tf.GradientTape() as tape:
+            # Forward pass
             y_pred_current = self(x, training=True)
-            loss_base = calculate_lgb_proxy_loss(
-                y_true, y_pred_current, {"is_old": is_old_flags}
-            )
-            loss_lls = tf.constant(0.0)
+
+            # 🔹 [1] Always use a primary CCE loss
+            cce_loss_fn = tf.keras.losses.CategoricalCrossentropy()
+            primary_loss = cce_loss_fn(y_true, y_pred_current)
+
+            # 🔹 [2] Optionally compute LGB loss
+            if USE_LGB_LLS:
+                loss_lgb = calculate_lgb_proxy_loss(
+                    y_true, y_pred_current, {"is_old": is_old_flags}
+                )
+            else:
+                loss_lgb = tf.constant(0.0)
+
+            # 🔹 [3] Optionally compute LLS loss
             if (
-                self.old_model_inference is not None
+                USE_LGB_LLS
+                and self.old_model_inference is not None
                 and self.old_class_indices is not None
             ):
                 y_pred_old = self.old_model_inference(x, training=False)
                 loss_lls = calculate_lls_loss(
                     y_true, y_pred_current, y_pred_old, self.old_class_indices
                 )
+            else:
+                loss_lls = tf.constant(0.0)
+
+            # 🔹 [4] Final loss
             total_loss = (
-                self.gamma_lgb * loss_base
+                primary_loss
+                + self.gamma_lgb * loss_lgb
                 + self.gamma_lls * loss_lls
                 + sum(self.losses)
             )
+
+        # Backward pass
         grads = tape.gradient(total_loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
+
+        # Update metrics
         self.compiled_loss(y_true, y_pred_current)
         self.compiled_metrics.update_state(y_true, y_pred_current)
+
         return {m.name: m.result() for m in self.metrics}
 
 
@@ -118,7 +143,7 @@ class Client(fl.client.NumPyClient):
             ],
         )
 
-        self.memory = DynamicExampleMemory(max_size=dem_max_size)
+        self.memory = DynamicExampleMemory(max_size=dem_max_size) if USE_DEM else None
         self.current_task_id = 0
         self.best_old_model_weights = None
         self.all_trained_class_indices = []
@@ -149,7 +174,10 @@ class Client(fl.client.NumPyClient):
             if self.current_task_id > 0:
                 self.best_old_model_weights = self.model.get_weights()
             self.current_task_id = new_task_id
-            self.memory.update_task(self.current_task_id, {})
+
+            if USE_DEM and self.memory is not None:
+                self.memory.update_task(self.current_task_id, {})
+
             self.all_trained_class_indices = sorted(
                 set(
                     cls
@@ -159,7 +187,12 @@ class Client(fl.client.NumPyClient):
             )
 
         x_new, y_new = self._load_data_for_task(self.current_task_id)
-        x_mem, y_mem = self.memory.sample(batch_size=batch_size // 2)
+
+        # sample from memory (if enabled)
+        if USE_DEM and self.memory is not None:
+            x_mem, y_mem = self.memory.sample(batch_size=batch_size // 2)
+        else:
+            x_mem, y_mem = None, None
 
         if x_mem is not None and len(x_mem) > 0:
             x_combined = np.concatenate((x_new, x_mem))
@@ -190,7 +223,9 @@ class Client(fl.client.NumPyClient):
         self.model.set_incremental_params(self.best_old_model_weights, old_classes)
 
         history = self.model.fit(dataset, epochs=epochs, verbose=0)
-        self.memory.store_samples(x_new, y_new)
+
+        if USE_DEM and self.memory is not None and len(x_new) > 0:
+            self.memory.store_samples(x_new, y_new)
 
         loss = history.history.get("loss", [0.0])[-1]
         acc = history.history.get("accuracy", [0.0])[-1]
@@ -206,7 +241,14 @@ class Client(fl.client.NumPyClient):
             self.Y_test, num_classes=self.num_classes
         )
         results = self.model.evaluate(self.X_test, y_test_one_hot, verbose=0)
-        return float(results[0]), len(self.X_test), {"accuracy": float(results[1])}
+        return (
+            float(results[0]),
+            len(self.X_test),
+            {
+                "loss": float(results[0]),
+                "accuracy": float(results[1]),
+            },
+        )
 
 
 def create_client(cid):
@@ -217,4 +259,7 @@ if __name__ == "__main__":
     client_id = os.getenv("CLIENT_ID", "client_0")
     server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1:8080")
     client = Client(client_id=client_id)
-    fl.client.start_numpy_client(server_address=server_address, client=client)
+    fl.client.start_client(
+        server_address="127.0.0.1:8080",
+        client=client.to_client(),
+    )
