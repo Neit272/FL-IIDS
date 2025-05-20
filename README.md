@@ -54,7 +54,7 @@ You can run FL-IIDS in several ways:
   ```shell
   python simulation.py --mode baseline --clients 3 --rounds 3
   ```
-  - `--mode`: Choose from `baseline`, [dem](http://_vscodecontentref_/3), or `full`.
+  - `--mode`: Choose from `baseline`, `dem`, or `full`.
   - `--clients`: Number of simulated clients (default: 3).
   - `--rounds`: Number of federated learning rounds (default: 3).
 
