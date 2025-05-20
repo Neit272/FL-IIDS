@@ -260,6 +260,6 @@ if __name__ == "__main__":
     server_address = os.getenv("SERVER_ADDRESS", "127.0.0.1:8080")
     client = Client(client_id=client_id)
     fl.client.start_client(
-        server_address="127.0.0.1:8080",
+        server_address=server_address,
         client=client.to_client(),
     )
