@@ -17,13 +17,18 @@ FL-IIDS is a research project that applies Federated Learning to the problem of 
 
 1. **Clone the repository** and navigate to the project directory.
 
-2. **Install dependencies** (preferably in a virtual environment):
+   ```shell
+   git clone https://github.com/Neit272/FL-IIDS.git
+   cd FL-IIDS
+   ```
+
+3. **Install dependencies** (preferably in a virtual environment):
 
    ```shell
    pip install -r requirements.txt
    ```
 
-3. **Download the UNSW_NB15 dataset**:
+4. **Download the UNSW_NB15 dataset**:
    - Download `UNSW_NB15_training-set.csv` and `UNSW_NB15_testing-set.csv` from the [official source](https://research.unsw.edu.au/projects/unsw-nb15-dataset).
    - Place both files in the `data/` folder inside the project directory.
 
@@ -41,7 +46,7 @@ You can run FL-IIDS in several ways:
   ```shell
   CLIENT_ID=client_1 python client.py
   ```
-  > **Note:** The server listens on port 8080 by default. If you wish to use a different port, update the _server_address_ in [server.py](./blob/main/server.py) and [client.py](./blob/main/client.py).
+  > **Note:** The server listens on port 8080 by default. If you wish to use a different port, update the _server_address_ in [server.py](./server.py) and [client.py](./client.py).
 
 ### 2. Automated Simulation
 
