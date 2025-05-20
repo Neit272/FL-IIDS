@@ -1,8 +1,8 @@
 import tensorflow as tf
 
 # Hệ số trọng số loss
-GAMMA_LGB = 0.5
-GAMMA_LLS = 0.5
+GAMMA_LGB = 0.1
+GAMMA_LLS = 0.1
 
 
 @tf.function
